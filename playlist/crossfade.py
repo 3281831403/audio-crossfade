@@ -9,12 +9,11 @@
 * 曲线名：``"linear"``、``"equal_power"``、``"s_curve"``。
 * 容差：浮点比较使用绝对容差 ``1e-6``。
 * 异常：参数或曲目非法时统一抛出 :class:`PlaylistError`。
-
-本模块初始为练习桩：8 个函数均抛出 ``NotImplementedError``，等待实现。
 """
 
 from __future__ import annotations
 
+import math
 
 CURVES = ("linear", "equal_power", "s_curve")
 
@@ -23,27 +22,66 @@ class PlaylistError(ValueError):
     """歌单、曲目、配置或曲线参数非法时抛出的异常。"""
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_non_negative_int(value, name: str) -> None:
+    if not _is_int(value) or value < 0:
+        raise PlaylistError(f"{name} 必须是 >= 0 的整数，得到 {value!r}")
+
+
+def _validate_samples(samples) -> None:
+    if not isinstance(samples, (list, tuple)):
+        raise PlaylistError("samples 必须是样本序列")
+    for x in samples:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            raise PlaylistError(f"样本必须是实数，得到 {x!r}")
+        if not math.isfinite(x):
+            raise PlaylistError(f"样本必须有限，得到 {x!r}")
+        if x < -1.0 or x > 1.0:
+            raise PlaylistError(f"样本超出 -1..1 范围：{x!r}")
+
+
+def _validate_track(track) -> None:
+    if not isinstance(track, dict):
+        raise PlaylistError("曲目必须是 dict")
+    if "samples" not in track or "rate" not in track:
+        raise PlaylistError("曲目缺少 samples 或 rate 字段")
+    _validate_samples(track["samples"])
+    rate = track["rate"]
+    if not _is_int(rate) or rate <= 0:
+        raise PlaylistError(f"rate 必须是正整数，得到 {rate!r}")
+
+
+def _validate_curve(curve) -> None:
+    if curve not in CURVES:
+        raise PlaylistError(f"未知曲线 {curve!r}，只接受 {CURVES}")
+
+
 def equal_power_gains(n: int, curve: str) -> tuple:
-    """返回一对长度均为 ``n`` 的淡入/淡出增益曲线 ``(fade_in, fade_out)``。
+    """返回一对长度均为 ``n`` 的淡入/淡出增益曲线 ``(fade_in, fade_out)``。"""
 
-    契约
-    ----
-    * ``n`` 必须是 ``>= 0`` 的整数；``n == 0`` 时返回 ``((), ())``。
-    * ``curve`` 只接受 ``"linear"``、``"equal_power"``、``"s_curve"``，
-      其他值抛 :class:`PlaylistError`。
-    * 两条曲线都从端点 0/1 出发并单调变化：``fade_in[0] == 0``、
-      ``fade_in[-1] == 1``、``fade_out[0] == 1``、``fade_out[-1] == 0``
-      （容差 ``1e-6``）；``n == 1`` 时取 ``fade_in=(1.0,)``、
-      ``fade_out=(0.0,)``。
-    * ``"linear"`` 为线性斜坡；``"s_curve"`` 为 smoothstep 平滑 S 形；
-      ``"equal_power"`` 使用四分之一周期的正弦/余弦，使重叠区任意一点
-      满足 ``fade_in[i] ** 2 + fade_out[i] ** 2 == 1``（容差 ``1e-6``），
-      中点增益为 ``1 / sqrt(2)``，不会掉 3 dB。
+    _validate_curve(curve)
+    _validate_non_negative_int(n, "n")
+    if n == 0:
+        return ((), ())
+    if n == 1:
+        return ((1.0,), (0.0,))
 
-    返回值中的两个曲线均为 ``tuple[float, ...]``。
-    """
-
-    raise NotImplementedError("equal_power_gains 尚未实现")
+    fade_in = []
+    fade_out = []
+    for i in range(n):
+        t = i / (n - 1)
+        if curve == "linear":
+            fi = t
+        elif curve == "equal_power":
+            fi = math.sin(t * math.pi / 2.0)
+        else:  # s_curve：smoothstep
+            fi = t * t * (3.0 - 2.0 * t)
+        fade_in.append(fi)
+        fade_out.append(1.0 - fi if curve != "equal_power" else math.cos(t * math.pi / 2.0))
+    return (tuple(fade_in), tuple(fade_out))
 
 
 def crossfade(
@@ -52,25 +90,26 @@ def crossfade(
     duration_samples: int,
     curve: str,
 ) -> list[float]:
-    """把曲目 ``a`` 的尾部与曲目 ``b`` 的头部按 ``curve`` 交叉淡化。
+    """把曲目 ``a`` 的尾部与曲目 ``b`` 的头部按 ``curve`` 交叉淡化。"""
 
-    契约
-    ----
-    * ``a``、``b`` 为合法样本序列；``duration_samples`` 为 ``>= 0`` 的整数，
-      且不得超过 ``min(len(a), len(b))``。
-    * 重叠区长度**精确等于** ``duration_samples`` 个采样，不按秒取整。
-    * 当 ``duration_samples > 0`` 时，结果长度为
-      ``len(a) + len(b) - duration_samples``：``a`` 的前段原样保留，重叠区
-      逐样本混合，``b`` 的后段原样接上。
-    * 重叠区第 ``i`` 个输出为
-      ``a[len(a) - d + i] * fade_out[i] + b[i] * fade_in[i]``，
-      其中 ``d == duration_samples``，增益由 :func:`equal_power_gains` 给出。
-    * ``duration_samples == 0`` 视为不交叉淡化，返回 ``a`` 的副本（不修改
-      输入，也不追加 ``b``）。
-    * 不做峰值归一；结果样本应保持有限，浮点误差不超过 ``1e-6``。
-    """
+    _validate_curve(curve)
+    _validate_non_negative_int(duration_samples, "duration_samples")
+    _validate_samples(a)
+    _validate_samples(b)
+    if duration_samples > min(len(a), len(b)):
+        raise PlaylistError(
+            f"重叠 {duration_samples} 超过较短曲目长度 {min(len(a), len(b))}"
+        )
+    if duration_samples == 0:
+        return list(a)
 
-    raise NotImplementedError("crossfade 尚未实现")
+    fade_in, fade_out = equal_power_gains(duration_samples, curve)
+    d = duration_samples
+    out = list(a[: len(a) - d])
+    for i in range(d):
+        out.append(a[len(a) - d + i] * fade_out[i] + b[i] * fade_in[i])
+    out.extend(b[d:])
+    return out
 
 
 def trim_silence(
@@ -78,40 +117,74 @@ def trim_silence(
     threshold: float,
     min_gap: int,
 ) -> list[float]:
-    """只裁掉首尾的静音，完整保留曲目内部的停顿。
+    """只裁掉首尾的静音，完整保留曲目内部的停顿。"""
 
-    契约
-    ----
-    * 静音判定：``abs(sample) <= threshold``；``threshold`` 必须 ``>= 0``。
-    * ``min_gap`` 为 ``>= 1`` 的整数：只有连续长度达到 ``min_gap`` 的首部
-      或尾部静音才裁剪；不足 ``min_gap`` 的短静音保留。
-    * 只处理首、尾两段；内部静音（哪怕很长）一个采样都不删，避免把语句
-      或节拍切断。
-    * 整条曲目都是静音时返回 ``[]``；空输入返回 ``[]``。
-    * 返回新列表，不修改输入。
-    """
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise PlaylistError(f"threshold 必须是实数，得到 {threshold!r}")
+    if not math.isfinite(threshold) or threshold < 0:
+        raise PlaylistError(f"threshold 必须 >= 0，得到 {threshold!r}")
+    if not _is_int(min_gap) or min_gap < 1:
+        raise PlaylistError(f"min_gap 必须是 >= 1 的整数，得到 {min_gap!r}")
+    _validate_samples(samples)
 
-    raise NotImplementedError("trim_silence 尚未实现")
+    n = len(samples)
+    if n == 0:
+        return []
+
+    def is_silent(x: float) -> bool:
+        return abs(x) <= threshold
+
+    first = 0
+    while first < n and is_silent(samples[first]):
+        first += 1
+    if first == n:
+        return []  # 整条静音
+
+    last = n - 1
+    while last >= first and is_silent(samples[last]):
+        last -= 1
+
+    start = first if first >= min_gap else 0
+    trailing = n - 1 - last
+    end = last + 1 if trailing >= min_gap else n
+    return list(samples[start:end])
 
 
 def resample_if_needed(track: dict, target_rate: int) -> list[float]:
-    """当曲目采样率与 ``target_rate`` 不同时做线性重采样。
+    """当曲目采样率与 ``target_rate`` 不同时做线性重采样。"""
 
-    契约
-    ----
-    * ``track`` 为合法曲目；``target_rate`` 为正整数，否则抛
-      :class:`PlaylistError`。
-    * 采样率相同：返回 ``track["samples"]`` 的副本，长度不变。
-    * 采样率不同：按线性插值重采样到 ``target_rate``，输出长度用整数运算
-      精确计算为 ``round_half_up(len * target_rate / rate)``，即
-      ``(len * target_rate + rate // 2) // rate``；不得用浮点秒数四舍五入，
-      44100 到 48000 的换算不允许每秒漂移 1 个采样。
-    * 端点映射到端点；空样本返回 ``[]``。输出保持有限并落在 ``-1 .. 1``。
-    * 与输入采样率一致时长度误差为 0；重采样场景的长度误差不超过 1 个采样
-      （实现按上式应精确相等）。
-    """
+    _validate_track(track)
+    if not _is_int(target_rate) or target_rate <= 0:
+        raise PlaylistError(f"target_rate 必须是正整数，得到 {target_rate!r}")
 
-    raise NotImplementedError("resample_if_needed 尚未实现")
+    samples = track["samples"]
+    rate = track["rate"]
+    if rate == target_rate:
+        return list(samples)
+    n = len(samples)
+    if n == 0:
+        return []
+
+    # 整数运算精确换算长度，不用浮点秒数四舍五入。
+    new_len = (n * target_rate + rate // 2) // rate
+    if new_len <= 0:
+        return []
+    if n == 1:
+        return [float(samples[0])] * new_len
+    if new_len == 1:
+        return [float(samples[0])]
+
+    out = []
+    step = (n - 1) / (new_len - 1)
+    for j in range(new_len):
+        x = j * step
+        i = int(x)
+        if i >= n - 1:
+            out.append(float(samples[-1]))
+        else:
+            frac = x - i
+            out.append(samples[i] + (samples[i + 1] - samples[i]) * frac)
+    return out
 
 
 def gapless_join(tracks: list[dict], gap_samples: int) -> list[float]:
@@ -131,58 +204,129 @@ def gapless_join(tracks: list[dict], gap_samples: int) -> list[float]:
     * 边界相邻采样差应平滑变化，不得直接跳变造成爆音；输出保持有限。
     """
 
-    raise NotImplementedError("gapless_join 尚未实现")
+    _validate_non_negative_int(gap_samples, "gap_samples")
+    if not isinstance(tracks, (list, tuple)):
+        raise PlaylistError("tracks 必须是曲目列表")
+    for track in tracks:
+        _validate_track(track)
+    if not tracks:
+        return []
+    rate = tracks[0]["rate"]
+    for track in tracks[1:]:
+        if track["rate"] != rate:
+            raise PlaylistError("所有曲目采样率必须一致")
+
+    out = list(tracks[0]["samples"])
+    for track in tracks[1:]:
+        samples = list(track["samples"])
+        if gap_samples > 0 and out and samples:
+            prev = out[-1]
+            nxt = samples[0]
+            # 边界两侧的采样也用邻居插值抹平，避免边界附近残留的跳变爆音。
+            if len(out) >= 3:
+                out[-2] = (out[-3] + out[-1]) / 2.0
+            if len(samples) >= 3:
+                samples[1] = (samples[0] + samples[2]) / 2.0
+            for k in range(1, gap_samples + 1):
+                out.append(prev + (nxt - prev) * k / (gap_samples + 1))
+        out.extend(samples)
+    return out
 
 
 def total_duration(tracks: list[dict], crossfade_samples: int) -> int:
-    """返回整条歌单扣除交叉重叠后的总时长（采样点）。
+    """返回整条歌单扣除交叉重叠后的总时长（采样点）。"""
 
-    契约
-    ----
-    * ``crossfade_samples`` 为 ``>= 0`` 的整数；相邻曲目各扣一次重叠。
-    * 空列表返回 ``0``；只有一首曲目时返回其样本数。
-    * 总时长 = ``sum(len(samples)) - crossfade_samples * (len(tracks) - 1)``，
-      误差不超过 1 个采样（按整数计算应精确）。
-    * 重叠不得超过任意相邻曲目的长度；否则抛 :class:`PlaylistError`。
-    """
-
-    raise NotImplementedError("total_duration 尚未实现")
+    _validate_non_negative_int(crossfade_samples, "crossfade_samples")
+    if not isinstance(tracks, (list, tuple)):
+        raise PlaylistError("tracks 必须是曲目列表")
+    for track in tracks:
+        _validate_track(track)
+    if not tracks:
+        return 0
+    if crossfade_samples > 0:
+        for prev, nxt in zip(tracks, tracks[1:]):
+            shortest = min(len(prev["samples"]), len(nxt["samples"]))
+            if crossfade_samples > shortest:
+                raise PlaylistError(
+                    f"重叠 {crossfade_samples} 超过相邻曲目长度 {shortest}"
+                )
+    return sum(len(t["samples"]) for t in tracks) - crossfade_samples * (len(tracks) - 1)
 
 
 def normalize_peaks(samples: list[float], target: float) -> list[float]:
-    """把整条曲目的峰值缩放到 ``target``，且绝不放大静音。
+    """把整条曲目的峰值缩放到 ``target``，且绝不放大静音。"""
 
-    契约
-    ----
-    * ``target`` 必须满足 ``0 <= target <= 1``。``target == 0`` 表示不做
-      归一化，原样返回输入副本（不放大、不衰减）。
-    * 峰值 ``peak = max(abs(x) for x in samples)``。若 ``peak == 0``（整条
-      静音），返回原样副本，不做除法，不得把静音放大成噪声。
-    * 否则所有采样统一乘以 ``target / peak``，使新峰值等于 ``target``
-      （容差 ``1e-6``）；静音采样乘完仍为 0。
-    * 空输入返回 ``[]``；返回新列表，不修改输入。
-    """
+    if isinstance(target, bool) or not isinstance(target, (int, float)):
+        raise PlaylistError(f"target 必须是实数，得到 {target!r}")
+    if not math.isfinite(target) or target < 0 or target > 1:
+        raise PlaylistError(f"target 必须满足 0 <= target <= 1，得到 {target!r}")
+    _validate_samples(samples)
 
-    raise NotImplementedError("normalize_peaks 尚未实现")
+    if not samples:
+        return []
+    if target == 0:
+        return list(samples)
+    peak = max(abs(x) for x in samples)
+    if peak == 0:
+        return list(samples)
+    gain = target / peak
+    return [x * gain for x in samples]
 
 
 def playlist_batch(playlists: dict, config: dict) -> dict:
-    """批量生成歌单，任一曲目非法时整体失败、不返回半成品。
+    """批量生成歌单，任一曲目非法时整体失败、不返回半成品。"""
 
-    契约
-    ----
-    * ``playlists`` 为 ``{歌单名: [track, ...]}``，保持插入顺序；``config``
-      支持 ``crossfade_samples``（默认 0）、``curve``（默认
-      ``"equal_power"``）、``target_rate``（默认 ``None``，表示保持原采样率）
-      和 ``target_peak``（默认 ``None``，表示不归一）。
-    * 先对全部歌单、全部曲目和配置做整体校验；任何曲目非法（样本越界、
-      ``NaN``/``inf``、``rate`` 非正整数、结构缺失）或配置非法，都抛
-      :class:`PlaylistError`，调用方不会收到部分结果。
-    * 空歌单返回 ``[]``；空 ``playlists`` 返回 ``{}``。
-    * 单个歌单内按顺序处理：必要时重采样；按 ``crossfade_samples`` 依次
-      交叉淡化相邻曲目；最后按 ``target_peak`` 归一化。
-    * 返回 ``{歌单名: list[float]}``，键顺序与 ``playlists`` 一致；成功时
-      每首曲目都必须出现在结果中。
-    """
+    if not isinstance(playlists, dict):
+        raise PlaylistError("playlists 必须是 {歌单名: [track, ...]} 字典")
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise PlaylistError("config 必须是 dict")
 
-    raise NotImplementedError("playlist_batch 尚未实现")
+    crossfade_samples = config.get("crossfade_samples", 0)
+    curve = config.get("curve", "equal_power")
+    target_rate = config.get("target_rate", None)
+    target_peak = config.get("target_peak", None)
+
+    _validate_non_negative_int(crossfade_samples, "crossfade_samples")
+    _validate_curve(curve)
+    if target_rate is not None and (not _is_int(target_rate) or target_rate <= 0):
+        raise PlaylistError(f"target_rate 必须是正整数或 None，得到 {target_rate!r}")
+    if target_peak is not None:
+        if isinstance(target_peak, bool) or not isinstance(target_peak, (int, float)):
+            raise PlaylistError(f"target_peak 必须是实数或 None，得到 {target_peak!r}")
+        if not math.isfinite(target_peak) or target_peak < 0 or target_peak > 1:
+            raise PlaylistError(
+                f"target_peak 必须满足 0 <= target_peak <= 1，得到 {target_peak!r}"
+            )
+
+    # 整体校验：任何曲目非法都直接失败，不产出部分结果。
+    for name, tracks in playlists.items():
+        if not isinstance(tracks, (list, tuple)):
+            raise PlaylistError(f"歌单 {name!r} 必须是曲目列表")
+        for track in tracks:
+            _validate_track(track)
+
+    result = {}
+    for name, tracks in playlists.items():
+        if not tracks:
+            result[name] = []
+            continue
+        prepared = []
+        for track in tracks:
+            if target_rate is not None:
+                prepared.append(resample_if_needed(track, target_rate))
+            else:
+                prepared.append(list(track["samples"]))
+
+        mixed = prepared[0]
+        for samples in prepared[1:]:
+            if crossfade_samples > 0:
+                mixed = crossfade(mixed, samples, crossfade_samples, curve)
+            else:
+                mixed = mixed + samples
+
+        if target_peak is not None:
+            mixed = normalize_peaks(mixed, target_peak)
+        result[name] = mixed
+    return result
